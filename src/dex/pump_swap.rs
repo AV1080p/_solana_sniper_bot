@@ -1,0 +1,958 @@
+use std::{str::FromStr, sync::Arc};
+use solana_program_pack::Pack;
+use solana_account_decoder::UiAccountEncoding;
+use anyhow::{anyhow, Result};
+use colored::Colorize;
+use anchor_client::solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::Keypair,
+    system_program,
+    system_instruction,
+    signer::Signer,
+};
+use crate::engine::transaction_parser::DexType;
+use spl_associated_token_account::{
+    get_associated_token_address,
+    instruction::create_associated_token_account_idempotent
+};
+use spl_token::{ui_amount_to_amount, instruction::sync_native};
+
+use crate::{
+    common::{config::SwapConfig, logger::Logger},
+    core::token,
+    engine::swap::{SwapDirection, SwapInType},
+};
+
+// Import the volume accumulator structures from pump_fun
+// PUMP SWAP FIXES:
+// 1. Fixed buy token amount calculation to use same direct formula as pump fun
+// 2. Fixed sell accounts to have reversed user account order (user SOL and token accounts swapped)
+//    compared to buy accounts, while keeping pool accounts in same order
+// 3. Added clear comments to distinguish buy vs sell account ordering
+
+// Constants - moved to lazy_static for single initialization
+lazy_static::lazy_static! {
+    static ref TOKEN_PROGRAM: Pubkey = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    static ref TOKEN_2022_PROGRAM: Pubkey = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    static ref ASSOCIATED_TOKEN_PROGRAM: Pubkey = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+    static ref PUMP_SWAP_PROGRAM: Pubkey = Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA").unwrap();
+    static ref PUMP_GLOBAL_CONFIG: Pubkey = Pubkey::from_str("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw").unwrap();
+    static ref PUMP_SWAP_FEE_RECIPIENT: Pubkey = Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV").unwrap();
+    static ref PUMP_SWAP_FEE_CONFIG: Pubkey = Pubkey::from_str("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx").unwrap();
+    static ref PUMP_SWAP_FEE_PROGRAM: Pubkey = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+    static ref PUMP_EVENT_AUTHORITY: Pubkey = Pubkey::from_str("GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR").unwrap();
+    static ref SOL_MINT: Pubkey = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+    static ref BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+    static ref SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+}
+
+// Volume accumulator seed constants
+const GLOBAL_VOLUME_ACCUMULATOR_SEED: &[u8] = b"global_volume_accumulator";
+const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";
+
+/// Get the global volume accumulator PDA for PumpSwap
+fn get_global_volume_accumulator_pda() -> Result<Pubkey> {
+    let seeds = [GLOBAL_VOLUME_ACCUMULATOR_SEED];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, &PUMP_SWAP_PROGRAM);
+    Ok(pda)
+}
+
+/// Get the user volume accumulator PDA for a specific user for PumpSwap
+fn get_user_volume_accumulator_pda(user: &Pubkey) -> Result<Pubkey> {
+    let seeds = [USER_VOLUME_ACCUMULATOR_SEED, user.as_ref()];
+    let (pda, _bump) = Pubkey::find_program_address(&seeds, &PUMP_SWAP_PROGRAM);
+    Ok(pda)
+}
+
+const TEN_THOUSAND: u64 = 10000;
+
+pub struct PumpSwap {
+    pub keypair: Arc<Keypair>,
+    pub rpc_client: Option<Arc<anchor_client::solana_client::rpc_client::RpcClient>>,
+    pub rpc_nonblocking_client: Option<Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>>,
+}
+
+impl PumpSwap {
+    pub fn new(
+        keypair: Arc<Keypair>,
+        rpc_client: Option<Arc<anchor_client::solana_client::rpc_client::RpcClient>>,
+        rpc_nonblocking_client: Option<Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>>,
+    ) -> Self {
+        Self {
+            keypair,
+            rpc_client,
+            rpc_nonblocking_client,
+        }
+    }
+
+    pub async fn get_token_price(&self, mint_str: &str) -> Result<f64> {
+        // For price calculation, we'll need to make RPC calls since we don't have trade info
+        // This is only used for price queries, not for building transactions
+        let mint = Pubkey::from_str(mint_str).map_err(|_| anyhow!("Invalid mint address"))?;
+        let rpc_client = self.rpc_nonblocking_client.clone()
+            .ok_or_else(|| anyhow!("RPC non-blocking client not initialized"))?;
+        
+        // For price queries, we need to get current pool state
+        let pool_info = get_pool_info_for_price(rpc_client, mint).await?;
+        
+        // Calculate price using current reserves
+        if pool_info.1 == 0 {
+            return Ok(0.0);
+        }
+        
+        // Price formula: quote_reserve / base_reserve  
+        let price = pool_info.2 as f64 / pool_info.1 as f64;
+        Ok(price)
+    }
+
+    /// Get basic pool information for selling strategy compatibility
+    /// Returns (pool_id, base_mint, quote_mint, base_reserve, quote_reserve)
+    pub async fn get_pool_info(&self, mint_str: &str) -> Result<(Pubkey, Pubkey, Pubkey, u64, u64)> {
+        let mint = Pubkey::from_str(mint_str).map_err(|_| anyhow!("Invalid mint address"))?;
+        let rpc_client = self.rpc_nonblocking_client.clone()
+            .ok_or_else(|| anyhow!("RPC non-blocking client not initialized"))?;
+        
+        let (pool_id, base_reserve, quote_reserve) = get_pool_info_for_price(rpc_client, mint).await?;
+        
+        Ok((pool_id, mint, *SOL_MINT, base_reserve, quote_reserve))
+    }
+
+    /// Get liquidity (quote reserve) for the pool
+    pub async fn get_pool_liquidity(&self, mint_str: &str) -> Result<f64> {
+        let (_, _, _, _, quote_reserve) = self.get_pool_info(mint_str).await?;
+        Ok(quote_reserve as f64 / 1e9) // Convert lamports to SOL
+    }
+
+    // Highly optimized build_swap_from_parsed_data - now uses only TradeInfoFromToken
+    pub async fn build_swap_from_parsed_data(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        swap_config: SwapConfig,
+    ) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        let logger = Logger::new("[PUMPSWAP-FROM-PARSED] => ".blue().to_string());
+        let _start_time = std::time::Instant::now();
+        
+        // Early validation
+        if trade_info.dex_type != DexType::PumpSwap {
+            return Err(anyhow!("Invalid transaction type"));
+        }
+        
+        let mint = Pubkey::from_str(&trade_info.mint)?;
+        let owner = self.keypair.pubkey();
+        
+        // Extract all needed data from TradeInfoFromToken
+        let pool_id = Pubkey::from_str(&trade_info.pool_id)?;
+        let coin_creator = if let Some(ref creator_str) = trade_info.coin_creator {
+            Pubkey::from_str(creator_str)?
+        } else {
+            return Err(anyhow!("Coin creator not found in trade info"));
+        };
+        
+        // Use virtual reserves from trade_info for calculations
+        let token_price = Self::calculate_price_from_virtual_reserves(
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        logger.log(format!("Using parsed data - Pool: {}, Coin Creator: {}, Virtual SOL: {}, Virtual Tokens: {}, Price: {}, Reverse: {}", 
+            pool_id, coin_creator, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves, token_price, swap_config.reverse));
+        
+        // Prepare swap parameters
+        // The 'reverse' flag indicates pool structure (WSOL as base vs token as base)
+        // It does NOT change the instruction type - Buy stays Buy, Sell stays Sell
+        let swap_direction = swap_config.swap_direction.clone();
+        let reverse = swap_config.reverse;
+        let discriminator = match (swap_direction.clone(), reverse) {
+            (SwapDirection::Buy, true) => *SELL_DISCRIMINATOR,
+            (SwapDirection::Buy, false) => *BUY_DISCRIMINATOR,
+            (SwapDirection::Sell, true) => *BUY_DISCRIMINATOR,
+            (SwapDirection::Sell, false) => *SELL_DISCRIMINATOR,
+        };
+        
+        let mut instructions = Vec::with_capacity(3); // Pre-allocate for typical case
+        
+        // Process swap direction using only parsed data
+        let (mut base_amount, mut quote_amount, accounts) = match swap_direction {
+            SwapDirection::Buy => self.prepare_buy_swap_from_parsed(
+                trade_info,
+                owner,
+                mint,
+                pool_id,
+                coin_creator,
+                swap_config.amount_in,
+                swap_config.buy_slippage, // Use buy slippage for buy operations
+                reverse,
+                &mut instructions,
+            ).await?,
+            SwapDirection::Sell => {
+                // For selling, this method should not be called directly
+                // Use build_swap_from_parsed_data_with_balance instead
+                return Err(anyhow!("For selling, use build_swap_from_parsed_data_with_balance method with cached balance"));
+            },
+        };
+        
+        // If reverse pool, swap base_amount and quote_amount for instruction
+        // Normal pool: base=token, quote=SOL
+        // Reverse pool: base=SOL, quote=token
+        if reverse {
+            std::mem::swap(&mut base_amount, &mut quote_amount);
+            logger.log(format!("Reverse pool: swapped amounts - base_amount (SOL): {}, quote_amount (token): {}", base_amount, quote_amount));
+        }
+        
+        // Add swap instruction if amount is valid
+        if base_amount > 0 {
+            instructions.push(create_swap_instruction(
+                *PUMP_SWAP_PROGRAM,
+                discriminator,
+                base_amount,
+                quote_amount,
+                accounts,
+            ));
+        } else {
+            return Err(anyhow!("Invalid swap amount"));
+        }
+        
+        // Handle WSOL account operations based on swap direction
+        match swap_direction {
+            SwapDirection::Buy => {
+                // For buy operations, close WSOL account after swap to unwrap WSOL back to SOL
+                let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+                
+                // First, sync native to ensure WSOL balance is updated
+                instructions.push(sync_native(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                )?);
+                
+                // Then close the WSOL account to unwrap WSOL back to SOL
+                instructions.push(spl_token::instruction::close_account(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                    &owner,
+                    &owner,
+                    &[&owner],
+                )?);
+            },
+            SwapDirection::Sell => {
+                // For sell operations, close WSOL account after swap to unwrap WSOL back to SOL
+                let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+                
+                // First, sync native to ensure WSOL balance is updated
+                instructions.push(sync_native(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                )?);
+                
+                // Then close the WSOL account to unwrap WSOL back to SOL
+                instructions.push(spl_token::instruction::close_account(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                    &owner,
+                    &owner,
+                    &[&owner],
+                )?);
+            }
+        }
+        
+        
+        Ok((self.keypair.clone(), instructions, token_price))
+    }
+
+    /// Build swap transaction with cached token balance (for selling without RPC calls)
+    pub async fn build_swap_from_parsed_data_with_balance(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        swap_config: SwapConfig,
+        cached_balance: Option<(u64, u8)>, // (raw_balance, decimals) - None for buying
+    ) -> Result<(Arc<Keypair>, Vec<Instruction>, f64)> {
+        let logger = Logger::new("[PUMPSWAP-WITH-BALANCE] => ".blue().to_string());
+        
+        
+        // Early validation
+        if trade_info.dex_type != DexType::PumpSwap {
+            return Err(anyhow!("Invalid transaction type"));
+        }
+        
+        let mint = Pubkey::from_str(&trade_info.mint)?;
+        let owner = self.keypair.pubkey();
+        
+        // Extract all needed data from TradeInfoFromToken
+        let pool_id = Pubkey::from_str(&trade_info.pool_id)?;
+        let coin_creator = if let Some(ref creator_str) = trade_info.coin_creator {
+            Pubkey::from_str(creator_str)?
+        } else {
+            return Err(anyhow!("Coin creator not found in trade info"));
+        };
+        
+        // Use virtual reserves from trade_info for calculations
+        let token_price = Self::calculate_price_from_virtual_reserves(
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        logger.log(format!("Using cached balance for PumpSwap - Pool: {}, Price: {}, Reverse: {}", pool_id, token_price, swap_config.reverse));
+        
+        // Prepare swap parameters
+        // The 'reverse' flag indicates pool structure, NOT the action type
+        let swap_direction = swap_config.swap_direction.clone();
+        let reverse = swap_config.reverse;
+        let discriminator = match (swap_direction.clone(), reverse) {
+            (SwapDirection::Buy, true) => *SELL_DISCRIMINATOR,
+            (SwapDirection::Buy, false) => *BUY_DISCRIMINATOR,
+            (SwapDirection::Sell, true) => *BUY_DISCRIMINATOR,
+            (SwapDirection::Sell, false) => *SELL_DISCRIMINATOR,
+        };
+        
+        let mut instructions = Vec::with_capacity(3);
+        
+        // Process swap direction - reverse flag only affects account structure
+        let (mut base_amount, mut quote_amount, accounts) = match swap_direction {
+            SwapDirection::Buy => self.prepare_buy_swap_from_parsed(
+                trade_info,
+                owner,
+                mint,
+                pool_id,
+                coin_creator,
+                swap_config.amount_in,
+                swap_config.buy_slippage, // Use buy slippage for buy operations
+                reverse,
+                &mut instructions,
+            ).await?,
+            SwapDirection::Sell => {
+                // Use cached balance for selling
+                if cached_balance.is_none() {
+                    return Err(anyhow!("Cached balance required for selling"));
+                }
+                
+                self.prepare_sell_swap_with_cached_balance(
+                    trade_info,
+                    owner,
+                    mint,
+                    pool_id,
+                    coin_creator,
+                    swap_config.amount_in,
+                    swap_config.in_type,
+                    reverse,
+                    cached_balance.unwrap(),
+                    &mut instructions,
+                ).await?
+            },
+        };
+        
+        // If reverse pool, swap base_amount and quote_amount for instruction
+        // Normal pool: base=token, quote=SOL
+        // Reverse pool: base=SOL, quote=token
+        if reverse {
+            std::mem::swap(&mut base_amount, &mut quote_amount);
+            logger.log(format!("Reverse pool: swapped amounts - base_amount (SOL): {}, quote_amount (token): {}", base_amount, quote_amount));
+        }
+        
+        // Add swap instruction if amount is valid
+        if base_amount > 0 {
+            instructions.push(create_swap_instruction(
+                *PUMP_SWAP_PROGRAM,
+                discriminator,
+                base_amount,
+                quote_amount,
+                accounts,
+            ));
+        } else {
+            return Err(anyhow!("Invalid swap amount"));
+        }
+        
+        // Handle WSOL account operations based on swap direction
+        match swap_direction {
+            SwapDirection::Buy => {
+                // For buy operations, close WSOL account after swap to unwrap WSOL back to SOL
+                let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+                
+                // First, sync native to ensure WSOL balance is updated
+                instructions.push(sync_native(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                )?);
+                
+                // Then close the WSOL account to unwrap WSOL back to SOL
+                instructions.push(spl_token::instruction::close_account(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                    &owner,
+                    &owner,
+                    &[&owner],
+                )?);
+            },
+            SwapDirection::Sell => {
+                // For sell operations, close WSOL account after swap to unwrap WSOL back to SOL
+                let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+                
+                // First, sync native to ensure WSOL balance is updated
+                instructions.push(sync_native(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                )?);
+                
+                // Then close the WSOL account to unwrap WSOL back to SOL
+                instructions.push(spl_token::instruction::close_account(
+                    &TOKEN_PROGRAM,
+                    &wsol_ata,
+                    &owner,
+                    &owner,
+                    &[&owner],
+                )?);
+            }
+        }
+        
+        
+        Ok((self.keypair.clone(), instructions, token_price))
+    }
+    
+    // Helper methods using only parsed data
+    async fn prepare_buy_swap_from_parsed(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        owner: Pubkey,
+        mint: Pubkey,
+        pool_id: Pubkey,
+        coin_creator: Pubkey,
+        amount_in: f64,
+        slippage_bps: u64,
+        is_reverse: bool,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(u64, u64, Vec<AccountMeta>)> {
+        let amount_specified = ui_amount_to_amount(amount_in, 9);
+        
+        // Calculate max_quote_amount_in first (with slippage) - this is what we'll use for transfer and swap
+        let max_quote_amount_in = max_amount_with_slippage(amount_specified, slippage_bps);
+        
+        // Use virtual reserves for calculation - return base_amount_out directly (without slippage)
+        // Matching working sample: slippage is handled via max_quote_amount_in for input
+        let base_amount_out = Self::calculate_buy_token_amount(
+            amount_specified,
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        // For reverse vs normal pools, the amounts structure differs:
+        // Normal pool (base=token, quote=SOL): instruction expects (base_amount_out, max_sol_in)
+        // Reverse pool (base=SOL, quote=token): after swap expects (max_sol_in, base_amount_out)
+        let quote_amount = max_quote_amount_in;
+        
+        // Validate amounts before proceeding
+        if base_amount_out == 0 {
+            return Err(anyhow!(
+                "Calculated token amount out is 0 - amount_in: {}, virtual_sol: {}, virtual_tokens: {}",
+                amount_specified,
+                trade_info.virtual_sol_reserves,
+                trade_info.virtual_token_reserves
+            ));
+        }
+        if quote_amount == 0 {
+            return Err(anyhow!(
+                "Calculated quote amount is 0 - amount_in: {}, slippage_bps: {}",
+                amount_specified,
+                slippage_bps
+            ));
+        }
+
+        let out_ata = get_associated_token_address(&owner, &mint);
+        
+        // Get the correct token program for the mint
+        let token_program = self.get_token_program(&mint).await.unwrap_or(*TOKEN_PROGRAM);
+        
+        // Always add Associated Token Account Program createIdempotent instruction
+        // This reduces latency by eliminating token account existence checks
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &owner,
+            &mint,
+            &token_program,
+        ));
+        self.cache_token_account(out_ata).await;
+        
+        // For buying, we need to wrap SOL to WSOL (only for normal mode)
+        // 1. Create WSOL account (idempotent - safe if already exists)
+        // 2. Transfer SOL to WSOL account  
+        // 3. Sync native to update WSOL balance
+        if !is_reverse {
+            let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+            
+            // Always create WSOL account (idempotent)
+            instructions.push(create_associated_token_account_idempotent(
+                &owner,
+                &owner,
+                &SOL_MINT,
+                &TOKEN_PROGRAM,
+            ));
+            
+            // Transfer SOL to WSOL account for the swap - use max_quote_amount_in to match quote_amount in swap
+            instructions.push(system_instruction::transfer(
+                &owner,
+                &wsol_ata,
+                max_quote_amount_in,
+            ));
+            
+            // Sync native to convert SOL to WSOL tokens
+            instructions.push(sync_native(
+                &TOKEN_PROGRAM,
+                &wsol_ata,
+            )?);
+            
+            // Cache the WSOL account
+            self.cache_token_account(wsol_ata).await;
+        }
+        
+        // Create accounts using parsed pool_id and coin_creator
+        let pool_base_account = get_associated_token_address(&pool_id, &mint);
+        let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
+        
+        // Get volume accumulator PDAs
+        let global_volume_accumulator = get_global_volume_accumulator_pda()?;
+        let user_volume_accumulator = get_user_volume_accumulator_pda(&owner)?;
+        
+        let accounts = if !is_reverse {
+            // Normal mode: use create_buy_accounts (matches working sample signature)
+            create_buy_accounts(
+                pool_id,
+                owner,
+                mint,
+                out_ata,
+                get_associated_token_address(&owner, &SOL_MINT),
+                pool_base_account,
+                pool_quote_account,
+                coin_creator,
+                global_volume_accumulator,
+                user_volume_accumulator,
+                is_reverse,
+            )?
+        } else {
+            // Reverse mode: use create_sell_accounts (per reverse sample logic)
+            create_sell_accounts(
+                pool_id,
+                owner,
+                mint,
+                out_ata,
+                get_associated_token_address(&owner, &SOL_MINT),
+                pool_base_account,
+                pool_quote_account,
+                coin_creator,
+                is_reverse,
+            )?
+        };
+        
+        // Return amounts for buy operation:
+        // For normal pool: (base_amount_out, quote_amount) = (token_out, max_sol_in) - no swap needed
+        // For reverse pool: (base_amount_out, quote_amount) = (token_out, max_sol_in) - will be swapped in main function
+        Ok((base_amount_out, quote_amount, accounts))
+    }
+
+    /// Prepare sell swap using cached balance instead of RPC calls
+    async fn prepare_sell_swap_with_cached_balance(
+        &self,
+        trade_info: &crate::engine::transaction_parser::TradeInfoFromToken,
+        owner: Pubkey,
+        mint: Pubkey,
+        pool_id: Pubkey,
+        coin_creator: Pubkey,
+        amount_in: f64,
+        in_type: SwapInType,
+        is_reverse: bool,
+        cached_balance: (u64, u8), // (raw_balance, decimals)
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(u64, u64, Vec<AccountMeta>)> {
+        let in_ata = get_associated_token_address(&owner, &mint);
+        let (balance_raw, token_decimals) = cached_balance;
+        
+        // For sell operations, ensure WSOL account exists (where user receives SOL)
+        let wsol_ata = get_associated_token_address(&owner, &SOL_MINT);
+        instructions.push(create_associated_token_account_idempotent(
+            &owner,
+            &owner,
+            &SOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
+        self.cache_token_account(wsol_ata).await;
+        
+        // Get coin creator vault authority and its ATA
+        let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+            &[b"creator_vault", coin_creator.as_ref()],
+            &PUMP_SWAP_PROGRAM,
+        );
+        let _coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &SOL_MINT);
+        
+        // Calculate amount to sell from cached balance
+        let amount = match in_type {
+            SwapInType::Qty => ui_amount_to_amount(amount_in, token_decimals),
+            SwapInType::Pct => {
+                let pct = amount_in.min(1.0);
+                if pct == 1.0 {
+                    balance_raw
+                } else {
+                    (pct * balance_raw as f64) as u64
+                }
+            }
+        };
+        
+        if amount == 0 {
+            return Err(anyhow!("Invalid sell amount"));
+        }
+        
+        if amount > balance_raw {
+            return Err(anyhow!("Insufficient balance: trying to sell {} but only have {}", amount, balance_raw));
+        }
+        
+        // Use virtual reserves for calculation
+        let quote_amount_out = Self::calculate_sell_sol_amount(
+            amount,
+            trade_info.virtual_sol_reserves,
+            trade_info.virtual_token_reserves,
+        );
+        
+        // Set minimum SOL output to 1 to ensure selling must work (no slippage needed)
+        // This allows the transaction to succeed regardless of price movement
+        let min_quote_amount_out = 1;
+        
+        println!("Sell calculation - Tokens in: {} (from cached balance: {}), Expected SOL out: {}, Min SOL out: {} (no slippage, set to 1 to ensure sell works), Virtual SOL: {}, Virtual Tokens: {}", 
+            amount, balance_raw, quote_amount_out, min_quote_amount_out, trade_info.virtual_sol_reserves, trade_info.virtual_token_reserves);
+        
+        // Create accounts using parsed pool_id and coin_creator
+        let pool_base_account = get_associated_token_address(&pool_id, &mint);
+        let pool_quote_account = get_associated_token_address(&pool_id, &SOL_MINT);
+        
+        let accounts = create_sell_accounts(
+            pool_id,
+            owner,
+            mint,
+            in_ata,
+            get_associated_token_address(&owner, &SOL_MINT),
+            pool_base_account,
+            pool_quote_account,
+            coin_creator,
+            is_reverse,
+        )?;
+        
+        // Return token amount in and min SOL amount out for sell orders
+        Ok((amount, min_quote_amount_out, accounts))
+    }
+    
+
+    
+    async fn cache_token_account(&self, _account: Pubkey) {
+        // Cache removed - no-op
+    }
+    
+    /// Helper method to determine the correct token program for a mint
+    async fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        if let Some(rpc_client) = &self.rpc_nonblocking_client {
+            match rpc_client.get_account(mint).await {
+                Ok(account) => {
+                    if account.owner == *TOKEN_2022_PROGRAM {
+                        Ok(*TOKEN_2022_PROGRAM)
+                    } else {
+                        Ok(*TOKEN_PROGRAM)
+                    }
+                },
+                Err(_) => {
+                    // Default to TOKEN_PROGRAM if we can't fetch the account
+                    Ok(*TOKEN_PROGRAM)
+                }
+            }
+        } else {
+            // Default to TOKEN_PROGRAM if no RPC client
+            Ok(*TOKEN_PROGRAM)
+        }
+    }
+
+    /// Calculate token amount out for buy using virtual reserves (PumpSwap AMM formula)
+    pub fn calculate_buy_token_amount(
+        sol_amount_in: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> u64 {
+        if sol_amount_in == 0 || virtual_sol_reserves == 0 || virtual_token_reserves == 0 {
+            return 0;
+        }
+        
+        // PumpSwap AMM formula for buy (same as PumpFun):
+        // tokens_out = (sol_in * virtual_token_reserves) / (virtual_sol_reserves + sol_in)
+        let sol_amount_in_u128 = sol_amount_in as u128;
+        let virtual_sol_reserves_u128 = virtual_sol_reserves as u128;
+        let virtual_token_reserves_u128 = virtual_token_reserves as u128;
+        
+        let numerator = sol_amount_in_u128.saturating_mul(virtual_token_reserves_u128);
+        let denominator = virtual_sol_reserves_u128.saturating_add(sol_amount_in_u128);
+        
+        if denominator == 0 {
+            return 0;
+        }
+        
+        numerator.checked_div(denominator).unwrap_or(0) as u64
+    }
+
+    /// Calculate SOL amount out for sell using virtual reserves (PumpSwap AMM formula)
+    pub fn calculate_sell_sol_amount(
+        token_amount_in: u64,
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> u64 {
+        if token_amount_in == 0 || virtual_sol_reserves == 0 || virtual_token_reserves == 0 {
+            return 0;
+        }
+        
+        // PumpSwap constant product AMM formula for sell:
+        // sol_out = (token_in * virtual_sol_reserves) / (virtual_token_reserves + token_in)
+        let token_amount_in_u128 = token_amount_in as u128;
+        let virtual_sol_reserves_u128 = virtual_sol_reserves as u128;
+        let virtual_token_reserves_u128 = virtual_token_reserves as u128;
+        
+        let numerator = token_amount_in_u128.saturating_mul(virtual_sol_reserves_u128);
+        let denominator = virtual_token_reserves_u128.saturating_add(token_amount_in_u128);
+        
+        if denominator == 0 {
+            return 0;
+        }
+        
+        numerator.checked_div(denominator).unwrap_or(0) as u64
+    }
+
+    /// Calculate price using virtual reserves
+    pub fn calculate_price_from_virtual_reserves(
+        virtual_sol_reserves: u64,
+        virtual_token_reserves: u64,
+    ) -> f64 {
+        if virtual_token_reserves == 0 {
+            return 0.0;
+        }
+        
+        // Price = virtual_sol_reserves / virtual_token_reserves
+        (virtual_sol_reserves as f64) / (virtual_token_reserves as f64)
+    }
+}
+
+/// Minimal pool info for price queries only (returns pool_id, base_reserve, quote_reserve)
+/// CRITICAL: Uses non-blocking RPC client to avoid blocking async runtime
+async fn get_pool_info_for_price(
+    rpc_client: Arc<anchor_client::solana_client::nonblocking::rpc_client::RpcClient>,
+    mint: Pubkey,
+) -> Result<(Pubkey, u64, u64)> {
+    use anchor_client::solana_client::rpc_config::{RpcProgramAccountsConfig, RpcAccountInfoConfig};
+    use anchor_client::solana_client::rpc_filter::{RpcFilterType, Memcmp, MemcmpEncodedBytes};
+    
+    let _logger = Logger::new("[PUMPSWAP-PRICE-QUERY] => ".blue().to_string());
+    
+    // Initialize
+    let sol_mint = *SOL_MINT;
+    let pump_program = *PUMP_SWAP_PROGRAM;
+    
+    // Find the pool - use async get_program_accounts
+    let mut pool_id = Pubkey::default();
+    match rpc_client.get_program_accounts_with_config(
+        &pump_program,
+        RpcProgramAccountsConfig {
+            filters: Some(vec![
+                RpcFilterType::DataSize(300),
+                RpcFilterType::Memcmp(Memcmp::new(43, MemcmpEncodedBytes::Base64(base64::encode(mint.to_bytes())))),
+            ]),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ).await {
+        Ok(accounts) => {
+            for (pubkey, account) in accounts.iter() {
+                if account.data.len() >= 75 {
+                    if let Ok(pubkey_from_data) = Pubkey::try_from(&account.data[43..75]) {
+                        if pubkey_from_data == mint {
+                            pool_id = *pubkey;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            return Err(anyhow!("Error getting program accounts: {}", err));
+        }
+    }
+    
+    if pool_id == Pubkey::default() {
+        return Err(anyhow!("Failed to find PumpSwap pool for mint {}", mint));
+    }
+    
+    // Derive token accounts
+    let pool_base_account = get_associated_token_address(&pool_id, &mint);
+    let pool_quote_account = get_associated_token_address(&pool_id, &sol_mint);
+    
+    // Get token balances - use async get_multiple_accounts
+    let accounts = rpc_client.get_multiple_accounts(&[pool_base_account, pool_quote_account]).await?;
+    
+    // Extract balances
+    let base_balance = if let Some(account_data) = &accounts[0] {
+        match spl_token::state::Account::unpack(&account_data.data) {
+            Ok(token_account) => token_account.amount,
+            Err(_) => 10_000_000_000_000 // Fallback
+        }
+    } else {
+        10_000_000_000_000 // Fallback
+    };
+    
+    let quote_balance = if let Some(account_data) = &accounts[1] {
+        match spl_token::state::Account::unpack(&account_data.data) {
+            Ok(token_account) => token_account.amount,
+            Err(_) => 10_000_000_000 // Fallback
+        }
+    } else {
+        10_000_000_000 // Fallback
+    };
+    
+    Ok((pool_id, base_balance, quote_balance))
+}
+
+#[inline]
+fn max_amount_with_slippage(input_amount: u64, slippage_bps: u64) -> u64 {
+    input_amount
+        .saturating_mul(TEN_THOUSAND.saturating_add(slippage_bps))
+        .checked_div(TEN_THOUSAND)
+        .unwrap_or(input_amount)
+}
+
+// Optimized account creation with const pubkeys
+fn create_buy_accounts(
+    pool_id: Pubkey,
+    user: Pubkey,
+    token_mint: Pubkey,
+    user_base_token_account: Pubkey,
+    wsol_account: Pubkey,
+    pool_base_token_account: Pubkey,
+    pool_quote_token_account: Pubkey,
+    coin_creator: Pubkey,
+    global_volume_accumulator: Pubkey,
+    user_volume_accumulator: Pubkey,
+    is_reverse: bool,
+) -> Result<Vec<AccountMeta>> {
+    let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+        &[b"creator_vault", coin_creator.as_ref()],
+        &PUMP_SWAP_PROGRAM,
+    );
+    
+    // For buy accounts:
+    // - Normal (is_reverse=false): user spends SOL to get tokens
+    //   User spends from wsol_account and receives to user_base_token_account
+    // - Reverse (is_reverse=true): account order is swapped
+    //   User account positions are reversed (token account first, then SOL account)
+    let (base_mint, quote_mint, user_account_1, user_account_2, pool_account_1, pool_account_2) = if is_reverse {
+        // REVERSE: SOL mint is base, token mint is quote. Account order matches reverse structure
+        (*SOL_MINT, token_mint, user_base_token_account, wsol_account,  pool_quote_token_account, pool_base_token_account)
+    } else {
+        // NORMAL: Token mint is base, SOL mint is quote. Account order: wsol_account first (spend), token_account second (receive)
+        (token_mint, *SOL_MINT, user_base_token_account, wsol_account,  pool_base_token_account, pool_quote_token_account)
+    };
+    
+    // CRITICAL FIX: coin_creator_vault_ata must use quote_mint (SOL_MINT for normal buy, token_mint for reverse)
+    // This matches the working sample which uses &quote_mint
+    let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &quote_mint);
+    
+    Ok(vec![
+        AccountMeta::new_readonly(pool_id, false),
+        AccountMeta::new(user, true),
+        AccountMeta::new_readonly(*PUMP_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(base_mint, false),
+        AccountMeta::new_readonly(quote_mint, false),
+        AccountMeta::new(user_account_1, false), // Position 5: Changes based on is_reverse
+        AccountMeta::new(user_account_2, false), // Position 6: Changes based on is_reverse
+        AccountMeta::new(pool_account_1, false), // Position 7: Changes based on is_reverse
+        AccountMeta::new(pool_account_2, false), // Position 8: Changes based on is_reverse
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_RECIPIENT, false),
+        AccountMeta::new(get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &quote_mint), false),
+        AccountMeta::new_readonly(*TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(*TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(*ASSOCIATED_TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(*PUMP_EVENT_AUTHORITY, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_PROGRAM, false),
+        AccountMeta::new(coin_creator_vault_ata, false),
+        AccountMeta::new_readonly(coin_creator_vault_authority, false),
+        AccountMeta::new(global_volume_accumulator, false),
+        AccountMeta::new(user_volume_accumulator, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_CONFIG, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_PROGRAM, false),
+        ])
+}
+
+// Similar optimization for sell accounts
+fn create_sell_accounts(
+    pool_id: Pubkey,
+    user: Pubkey,
+    token_mint: Pubkey,
+    user_base_token_account: Pubkey,
+    wsol_account: Pubkey,
+    pool_base_token_account: Pubkey,
+    pool_quote_token_account: Pubkey,
+    coin_creator: Pubkey,
+    is_reverse: bool,
+) -> Result<Vec<AccountMeta>> {
+
+    let (coin_creator_vault_authority, _) = Pubkey::find_program_address(
+        &[b"creator_vault", coin_creator.as_ref()],
+        &PUMP_SWAP_PROGRAM,
+    );
+    
+    // For sell accounts:
+    // - Normal (is_reverse=false): user sells tokens to get SOL
+    //   SOL account (where user receives) comes first, token account (where user spends) comes second
+    // - Reverse (is_reverse=true): account order is swapped
+    //   Token account comes first, SOL account second (like buy structure)
+    let (base_mint, quote_mint, user_account_1, user_account_2, pool_account_1, pool_account_2) = if is_reverse {
+        // REVERSE: Token account first, SOL account second (like buy structure)
+        (*SOL_MINT, token_mint, wsol_account, user_base_token_account, pool_quote_token_account, pool_base_token_account)
+    } else {
+        // NORMAL: SOL account (receive) first, token account (spend) second
+        (token_mint, *SOL_MINT, user_base_token_account, wsol_account, pool_base_token_account, pool_quote_token_account)
+    };
+    
+    // CRITICAL FIX: coin_creator_vault_ata must use quote_mint (matches working sample)
+    let coin_creator_vault_ata = get_associated_token_address(&coin_creator_vault_authority, &quote_mint);
+    
+    Ok(vec![
+        AccountMeta::new_readonly(pool_id, false),
+        AccountMeta::new(user, true),
+        AccountMeta::new_readonly(*PUMP_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(base_mint, false),
+        AccountMeta::new_readonly(quote_mint, false),
+        AccountMeta::new(user_account_1, false), // Position 5: Changes based on is_reverse
+        AccountMeta::new(user_account_2, false), // Position 6: Changes based on is_reverse
+        AccountMeta::new(pool_account_1, false), // Position 7: Changes based on is_reverse
+        AccountMeta::new(pool_account_2, false), // Position 8: Changes based on is_reverse
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_RECIPIENT, false),
+        AccountMeta::new(get_associated_token_address(&PUMP_SWAP_FEE_RECIPIENT, &quote_mint), false),
+        AccountMeta::new_readonly(*TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(*TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(*ASSOCIATED_TOKEN_PROGRAM, false),
+        AccountMeta::new_readonly(*PUMP_EVENT_AUTHORITY, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_PROGRAM, false),
+        AccountMeta::new(coin_creator_vault_ata, false),
+        AccountMeta::new_readonly(coin_creator_vault_authority, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_CONFIG, false),
+        AccountMeta::new_readonly(*PUMP_SWAP_FEE_PROGRAM, false),
+])
+}
+
+// Optimized instruction creation
+fn create_swap_instruction(
+    program_id: Pubkey,
+    discriminator: [u8; 8],
+    base_amount: u64,
+    quote_amount: u64,
+    accounts: Vec<AccountMeta>,
+) -> Instruction {
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&discriminator);
+    data.extend_from_slice(&base_amount.to_le_bytes());
+    data.extend_from_slice(&quote_amount.to_le_bytes());
+    
+    Instruction { program_id, accounts, data }
+}
+

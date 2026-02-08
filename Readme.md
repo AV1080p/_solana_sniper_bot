@@ -112,6 +112,9 @@ Create a `.env` file in the project root (see `src/env.example` for the full lis
 
 Copy `src/env.example` to `.env` and fill in your values.
 
+## 🖼 Screenshots
+
+<img width="800" height="300" alt="image" src="https://github.com/user-attachments/assets/d9765e48-7de4-4cfc-8bbb-0cc5f23049c6" />
 
 
 ## 📁 Project Structure
